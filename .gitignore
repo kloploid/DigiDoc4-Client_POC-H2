@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Thumbnails / misc
+Thumbs.db
+desktop.ini

@@ -1,0 +1,673 @@
+================================================================================
+SECURITY ADVISORY
+DigiDoc4 Client — AppleScript injection via container filename in
+macOS mailto: URL handler leads to arbitrary script execution
+================================================================================
+
+CWE:           CWE-94 (Improper Control of Generation of Code —
+               'Code Injection')
+Severity:      High
+CVSS 3.1:      7.8  (AV:L/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:N)
+Affected:      DigiDoc4 Client, all current versions on macOS
+               (Linux and Windows code paths use different mailto:
+                handlers and require independent review)
+Reporter:      Mark Zelinski
+Contact:       mazeli@taltech.ee
+Disclosure:    Submitted privately to CERT-EE (cert@cert.ee) for
+               forwarding to RIA, because the open-eid/DigiDoc4-Client
+               repository does not have GitHub private vulnerability
+               reporting enabled (/security/advisories/new returns 404).
+Status:        Private disclosure — please do not publish before fix
+               is released.
+Date:          14.05.2026
+
+
+--------------------------------------------------------------------------------
+1. SUMMARY
+--------------------------------------------------------------------------------
+
+DigiDoc4 Client on macOS constructs AppleScript source by direct string
+concatenation of two values extracted from a mailto: URL, then executes
+that source via NSAppleScript. The two values originate from the
+filename of the currently opened signed container, which is attacker-
+controlled in any realistic delivery scenario.
+
+An attacker who delivers a signed container with a crafted filename
+(email attachment, web download, USB, shared folder, instant messenger,
+etc.) can execute arbitrary AppleScript inside the DigiDoc4 process
+when the victim opens the container and clicks the "Send by email"
+envelope button on the container view. The attack chain consists of
+one filename + the victim opening it as they would any signed
+document + one click on the envelope button which is the natural
+next step in many signing workflows. There is no security prompt at
+any step.
+
+The injected AppleScript runs with `do shell script` reachable via
+appleeventsd, verified working on macOS 26 during PoC development.
+This is sufficient to escape the application sandbox into the
+calling user's context and obtain effectively arbitrary code
+execution as that user.
+
+In addition, the injected AppleScript runs with the AppleEvent
+capabilities granted to DigiDoc4 by its sandbox entitlements:
+
+    com.apple.security.scripting-targets:
+        com.apple.mail (com.apple.mail.compose)
+    com.apple.security.temporary-exception.apple-events:
+        com.microsoft.outlook
+
+These entitlements were declared so DigiDoc4 itself could compose
+mail via AppleScript — the same feature the attacker now hijacks.
+They enable sending arbitrary mail as the victim, attaching
+arbitrary local files as the victim's identity, and (for Outlook
+users) manipulating an arbitrary Outlook AppleEvent surface.
+
+The included PoC opens a rickroll URL in the default browser. That
+is a deliberately benign side-effect chosen to make the
+demonstration safe to run on a developer workstation. The
+vulnerability primitive — arbitrary AppleScript execution with
+shell-escape reach inside the DigiDoc4 process — is independent
+of which side-effect the payload chooses. Section 5 describes the
+realistic impact that follows from this primitive.
+
+
+--------------------------------------------------------------------------------
+2. AFFECTED CODE
+--------------------------------------------------------------------------------
+
+Repository:    https://github.com/open-eid/DigiDoc4-Client
+File:          client/Application_mac.mm
+Lines:         100-146 (Application::mailTo)
+
+    void Application::mailTo( const QUrl &url )
+    {
+        QUrlQuery q(url);
+        if(NSURL *appUrl = [NSWorkspace.sharedWorkspace
+                URLForApplicationToOpenURL:url.toNSURL()])
+        {
+            QString p;
+            QTextStream s( &p );
+            if([appUrl.path rangeOfString:@"/Applications/Mail.app"]
+                  .location != NSNotFound)
+            {
+                s << "on run" << Qt::endl
+                  << "set vattachment to \""
+                  << q.queryItemValue("attachment") << "\"" << Qt::endl
+                  << "set vsubject to \""
+                  << q.queryItemValue("subject")    << "\"" << Qt::endl
+                  ...
+            }
+            else if([appUrl.path rangeOfString:@"Outlook"].location
+                       != NSNotFound)
+            {
+                s << "on run" << Qt::endl
+                  << "set vattachment to \""
+                  << q.queryItemValue(u"attachment"_s)
+                  << "\" as POSIX file" << Qt::endl
+                  << "set vsubject to \""
+                  << q.queryItemValue(u"subject"_s) << "\"" << Qt::endl
+                  ...
+            }
+            if(!p.isEmpty())
+            {
+                NSDictionary *err;
+                if([[[NSAppleScript alloc]
+                       initWithSource:p.toNSString()]
+                       executeAndReturnError:&err])
+                    return;
+            }
+        }
+        QDesktopServices::openUrl( url );
+    }
+
+q.queryItemValue("attachment") and q.queryItemValue("subject") return
+URL-decoded user-controlled text that is spliced directly between
+AppleScript string-literal delimiters ("..."). There is no escaping
+of `\` or `"`, no allowlist of permitted characters, no length cap.
+
+Data source:
+File:          client/widgets/ContainerPage.cpp
+Lines:         80-90
+
+    connect(ui->email, &QAbstractButton::clicked, this, [this] {
+        if(!QFileInfo::exists(fileName))
+            return;
+        QUrlQuery q;
+        q.addQueryItem(QStringLiteral("subject"),
+                       QFileInfo(fileName).fileName());
+        q.addQueryItem(QStringLiteral("attachment"),
+                       QFileInfo(fileName).absoluteFilePath());
+        QUrl url;
+        url.setScheme(QStringLiteral("mailto"));
+        url.setQuery(q);
+        QDesktopServices::openUrl(url);
+    });
+
+Both subject (full filename) and attachment (absolute path, which
+contains the filename verbatim) are derived from a filesystem name
+fully controlled by whoever produced the container. APFS / HFS+
+permits every byte except `/` and `\0` in filenames, including `"`,
+`\`, `&`, parentheses, and newlines — every character needed to
+break out of the AppleScript string literal and inject code. The
+remaining `/` constraint is bypassed inside the AppleScript itself
+by assembling the character via `ASCII character 47` at runtime
+(see Section 4).
+
+In-process registration of the mailto: handler:
+File:          client/Application.cpp
+Line:          417
+
+    QDesktopServices::setUrlHandler(
+        QStringLiteral("mailto"), this, "mailTo");
+
+This intercepts QDesktopServices::openUrl(mailto:...) calls from
+within DigiDoc4 itself and routes them to the vulnerable handler
+instead of the operating system's mailto: registry. The data
+never crosses a process boundary that might sanitise it.
+
+Entitlements that amplify impact (these are by design — DigiDoc4
+itself uses the AppleScript bridge for mail composition):
+File:          qdigidoc4.entitlements
+Lines:         17-33
+
+    <key>com.apple.security.scripting-targets</key>
+    <dict>
+        <key>com.apple.mail</key>
+        <array>
+            <string>com.apple.mail.compose</string>
+        </array>
+    </dict>
+    ...
+    <key>com.apple.security.temporary-exception.apple-events</key>
+    <array>
+        <string>com.microsoft.outlook</string>
+    </array>
+
+
+--------------------------------------------------------------------------------
+3. THREAT MODEL
+--------------------------------------------------------------------------------
+
+The attacker controls the name of a signed container delivered to
+the victim. Realistic delivery channels:
+
+  - Email attachment from a counterparty (real or impersonated).
+  - Drive-by download from a compromised or attacker-controlled
+    site. Many delivery paths (cloud-sync extraction, archive
+    extraction, USB, network shares, IM attachments) strip the
+    Apple quarantine xattr, so no Gatekeeper / quarantine prompt
+    fires; Gatekeeper does not apply to data files in any case.
+  - Shared cloud folder (Dropbox / OneDrive / iCloud Drive)
+    containing a crafted file.
+  - Instant messenger attachment (Signal, Telegram, Slack,
+    WhatsApp). None of these strip filenames or interpret
+    AppleScript metacharacters.
+  - USB stick handed over in person, typical for legal /
+    notary workflows where physical media is still used.
+
+Victim role: end user of DigiDoc4 — a citizen, lawyer, accountant,
+civil servant, or business professional, signing or receiving
+electronically signed documents as part of normal Estonian /
+Latvian eID workflows.
+
+Required victim action:
+  1. Open the container in DigiDoc4 (this is the registered
+     handler for .bdoc / .asice / .cdoc / .ddoc — most users
+     double-click).
+  2. Click the envelope ("Send by email") button on the
+     container view, a legitimate, expected action for
+     forwarding a signed document to a counterparty.
+
+That is the entire interaction. No browser warning, no
+Gatekeeper prompt, no further click-through. The "Send by
+email" button is the natural next step in many signing
+workflows.
+
+The attack does NOT require:
+  - Compromise of any SK / RIA infrastructure.
+  - Network position / MITM.
+  - Local admin or root.
+  - Defeating macOS code signing.
+  - Bypassing Gatekeeper.
+
+Filename stealth: the injected payload is physically present in
+the filename, but in the typical UI surfaces between file
+delivery and the envelope click (Mail.app attachment list,
+Finder list / column view, DigiDoc4's own window title bar —
+all of which truncate filenames around 40-50 characters with a
+middle ellipsis), a long benign prefix and suffix bracketing
+the payload hide it inside the ellipsis. A filename rendered as
+"Договор_аренды_от_15.05.2024…final_v3.cdoc" in typical
+truncating UIs is achievable within the APFS 255-byte limit
+and conceals the AppleScript syntax entirely.
+
+
+--------------------------------------------------------------------------------
+4. PROOF OF CONCEPT
+--------------------------------------------------------------------------------
+
+A single working PoC is included with this submission. It was
+chosen to be obviously benign — the side effect is opening a
+YouTube URL — so it can be safely run on a developer
+workstation without producing files, network exfiltration, or
+persistence artefacts.
+
+File:
+
+    rickroll" & (do shell script ("open https:"
+        & (ASCII character 47) & (ASCII character 47)
+        & "youtu.be" & (ASCII character 47)
+        & "dQw4w9WgXcQ")) & ".cdoc
+
+The file is a byte-identical copy of a valid signed container;
+the filename itself is the payload. The leading `"` closes the
+AppleScript string literal at Application_mac.mm:110 (`set
+vattachment to "..."`). `&` then appends the result of an
+AppleScript expression that calls `do shell script` with a URL
+constructed at runtime (the `/` character cannot appear in a
+macOS filename, so it is synthesised via `ASCII character 47`
+and concatenated into the URL inside the script). A second `"`
+reopens a literal so the rest of the script remains
+syntactically valid.
+
+Verified behaviour on macOS 26 (Sequoia):
+
+  Step A — open the file:
+    Double-click → DigiDoc4 opens the container in the normal
+    UI. No prompt, no error. Signature status is rendered
+    normally; the malicious filename does not invalidate the
+    signed contents.
+
+  Step B — trigger the injection:
+    Click the envelope ("Send by email") button on the
+    container view.
+
+  Step C — observe side effect:
+    BEFORE the new-mail window appears in Mail.app, the user's
+    default browser opens https://youtu.be/dQw4w9WgXcQ.
+    Afterwards Mail.app opens the new-message window as
+    expected. The injection completes invisibly; nothing in
+    the DigiDoc4 UI indicates that an extra action took
+    place.
+
+      → CONFIRMED end-to-end on the reporter's test stand.
+
+This proves the underlying primitive: arbitrary AppleScript
+runs inside the DigiDoc4 process, with `do shell script`
+reaching outside the application sandbox via appleeventsd, as
+a direct consequence of opening a single file and clicking a
+single ordinary UI button. The rickroll URL is the only
+attacker-controlled value in this particular PoC, but every
+character of the shell command is attacker-controlled in the
+general case.
+
+Why this single PoC is sufficient:
+
+  The structural pattern
+
+      <prefix>" & (do shell script ("<sh command>")) & ".cdoc
+
+  is the exploit. The contents of `<sh command>` are
+  arbitrary. Section 5 lists realistic alternative payloads
+  that fit the same structure and reach the consequences
+  enumerated there. Each is a one-line edit to the filename
+  and requires no additional PoC infrastructure to verify.
+
+
+--------------------------------------------------------------------------------
+5. IMPACT
+--------------------------------------------------------------------------------
+
+The rickroll PoC opens a YouTube URL; that is the most benign shell
+command the template supports. The structural pattern —
+`<prefix>" & (do shell script ("<sh command>")) & ".cdoc` — is the
+exploit. The shell command is arbitrary attacker-controlled text.
+
+`do shell script` is dispatched via appleeventsd, which is not itself
+sandboxed. The PoC confirms this path succeeds on macOS 26: the payload
+executes as the calling user, outside the application sandbox. This is
+sufficient for arbitrary file read/write, outbound network use (the
+sandbox already grants com.apple.security.network.client), and
+persistence via ~/Library/LaunchAgents/.
+
+Independently of the shell escape, the AppleScript entitlements in
+qdigidoc4.entitlements give the injected payload direct access to
+Mail.app (com.apple.mail.compose) and Outlook (temporary-exception
+apple-events). This allows the payload to send mail from the victim's
+account with arbitrary local file attachments — without any visible
+compose window — and to drive Outlook in enterprise deployments.
+
+In all cases, outcome is determined solely by the shell command inside
+the filename. The PoC establishes the primitive; the consequences
+above are reachable by changing only that command.
+
+
+--------------------------------------------------------------------------------
+6. EXISTING DEFENCES — AND WHY THEY ARE NOT SUFFICIENT
+--------------------------------------------------------------------------------
+
+DigiDoc4 has three defence-in-depth layers around the vulnerable
+code. None closes the hole.
+
+6.1 App Sandbox (partial, deliberately open for the relevant capability)
+------------------------------------------------------------------------
+
+  Location: qdigidoc4.entitlements lines 9-33
+
+  The application runs with com.apple.security.app-sandbox = true.
+  The sandbox does limit certain attacker actions (raw posix_spawn
+  from the app process, direct writes outside user-selected files,
+  network beyond client mode).
+
+  However:
+
+  (a) The sandbox is explicitly opened for the exact
+      capabilities the attacker needs to weaponise this bug
+      (com.apple.mail / com.microsoft.outlook AppleEvent
+      bridges — see Section 5.2). These entitlements exist
+      because DigiDoc4 itself drives mail composition
+      through AppleScript, which is the very feature the
+      attacker hijacks.
+
+  (b) `do shell script` is dispatched via appleeventsd,
+      which is not itself sandboxed. On the reporter's
+      macOS 26 stand `do shell script` from the injected
+      payload succeeded (the rickroll PoC exercises this
+      path). The sandbox does not contain this escape.
+
+  (c) Even where future macOS sandbox tightening blocks
+      `do shell script`, the entitlement-mediated Mail.app
+      drive of Section 5.2 alone is sufficient for
+      arbitrary file exfiltration via the victim's mail
+      identity. The sandbox cannot prevent it without
+      breaking DigiDoc4's legitimate mail-compose flow.
+
+6.2 No input validation on filenames (no defence at all)
+--------------------------------------------------------
+
+  There is no check anywhere on the path between
+  ContainerPage::email's connect lambda (lines 80-90) and
+  Application::mailTo (Application_mac.mm:100-146) that
+  examines the filename for unusual characters. Data flow:
+
+      filesystem
+        → QFileInfo
+        → QUrlQuery::addQueryItem (percent-encodes for URL)
+        → in-process URL handler
+        → QUrlQuery::queryItemValue (decodes, restoring the
+                                     original bytes)
+        → AppleScript source string.
+
+  Every layer in this pipeline preserves attacker bytes
+  intact; none neutralises them.
+
+6.3 Gatekeeper / quarantine prompt (does not apply)
+---------------------------------------------------
+
+  Gatekeeper enforces signing / notarisation checks on
+  executable code (.app, .pkg, .dmg, command-line binaries
+  with the quarantine xattr). Signed-document containers
+  (.bdoc, .asice, .cdoc, .ddoc) are data files and never
+  trigger Gatekeeper. A one-time "downloaded from Internet,
+  are you sure?" dialog may appear for files with the
+  quarantine bit set, but it shows only the filename text,
+  not its semantic content; and on common delivery routes
+  (cloud sync, USB, archive extraction, IM) the quarantine
+  bit is not set at all.
+
+6.4 User vigilance against filenames (ineffective)
+--------------------------------------------------
+
+  In Finder list view with a wide Name column, or in
+  Terminal `ls`, the malicious filename is fully visible.
+  But the realistic UI surfaces between file arrival and
+  the envelope click — Mail.app's attachment list,
+  Finder's icon / column view, DigiDoc4's own window
+  title bar — all truncate around 40-50 characters with
+  a middle ellipsis. A filename like
+  "Договор_аренды_от_15.05.2024…final_v3.cdoc" conceals
+  the AppleScript syntax entirely inside that ellipsis
+  while remaining within the APFS 255-byte limit.
+
+  Browser-vendor experience with security-warning fatigue
+  (Akhawe & Felt 2013, "Alice in Warningland"; Reeder et
+  al. 2018, "An Experience Sampling Study of User
+  Reactions to Browser Warnings") applies analogously:
+  users reading filenames carefully before opening
+  "expected" documents is not a reliable defence,
+  particularly in repeat-document workflows (legal,
+  accounting, government processing) where click-through
+  fatigue is established.
+
+
+--------------------------------------------------------------------------------
+7. LIMITATIONS / WHAT THIS BUG IS NOT
+--------------------------------------------------------------------------------
+
+  - Not a remote / network-triggered vulnerability. The attacker
+    must deliver a file by some channel.
+  - Not a zero-click vulnerability. The victim must open the
+    container and click "Send by email" — both ordinary,
+    expected actions for the workflow.
+  - Not a forgery of digital signatures by itself. Signature
+    creation and verification are handled by libdigidocpp /
+    libcdoc and are not affected by this bug.
+  - Not exploitable against the Linux or Windows builds. The
+    Linux mailto: path uses xdg-email and the Windows path
+    uses MAPI; both should be audited separately for analogous
+    string-concatenation patterns.
+
+
+--------------------------------------------------------------------------------
+8. SUGGESTED FIX
+--------------------------------------------------------------------------------
+
+Three solutions are offered, in increasing order of robustness.
+The reporter recommends shipping (8.1) immediately as a hot-fix
+and (8.3) as the long-term replacement.
+
+8.1 Minimum patch — escape AppleScript metacharacters
+------------------------------------------------------
+
+  Add a helper that escapes the only two characters significant
+  inside an AppleScript string literal (`\` and `"`), drop
+  control characters that would split the literal across lines,
+  and apply it to both ingested values in both branches.
+
+      static QString escapeForAppleScriptLiteral(const QString &in)
+      {
+          QString out;
+          out.reserve(in.size() + 8);
+          for(QChar c : in) {
+              ushort u = c.unicode();
+              if(u < 0x20) continue;          // drop control bytes
+              if(u == '\\' || u == '"')
+                  out.append(QLatin1Char('\\'));
+              out.append(c);
+          }
+          return out;
+      }
+
+      // Application_mac.mm:110-111 (Mail branch)
+      << "set vattachment to \""
+         << escapeForAppleScriptLiteral(
+                q.queryItemValue(u"attachment"_s))
+         << "\"" << Qt::endl
+      << "set vsubject to \""
+         << escapeForAppleScriptLiteral(
+                q.queryItemValue(u"subject"_s))
+         << "\"" << Qt::endl
+
+      // Application_mac.mm:122-123 (Outlook branch): same change.
+
+  Small diff, no architectural change, hot-fix grade. This is
+  negative defence (relies on completeness of the escape list);
+  prefer 8.2 or 8.3 as the durable fix.
+
+8.2 Proper fix — parameterise the AppleScript
+---------------------------------------------
+
+  Make the script body a constant template with an `on run argv`
+  handler, and pass the values as positional arguments via
+  NSAppleEventDescriptor. User strings never enter the script
+  source.
+
+      NSString *src = @"on run argv\n"
+                      @"  set vattachment to item 1 of argv\n"
+                      @"  set vsubject    to item 2 of argv\n"
+                      @"  tell application \"Mail\"\n"
+                      @"    set msg to make new outgoing message"
+                          @" with properties {subject:vsubject,"
+                          @" visible:true}\n"
+                      @"    tell content of msg to make new"
+                          @" attachment with properties"
+                          @" {file name:(vattachment as POSIX file)"
+                          @" as alias}\n"
+                      @"    activate\n"
+                      @"  end tell\n"
+                      @"end run\n";
+
+      NSAppleEventDescriptor *args =
+          [NSAppleEventDescriptor listDescriptor];
+      [args insertDescriptor:[NSAppleEventDescriptor
+                  descriptorWithString:attachment.toNSString()]
+                    atIndex:1];
+      [args insertDescriptor:[NSAppleEventDescriptor
+                  descriptorWithString:subject.toNSString()]
+                    atIndex:2];
+
+      ProcessSerialNumber psn = {0, kCurrentProcess};
+      NSAppleEventDescriptor *target = [NSAppleEventDescriptor
+          descriptorWithDescriptorType:typeProcessSerialNumber
+                                 bytes:&psn
+                                length:sizeof(psn)];
+      NSAppleEventDescriptor *event = [NSAppleEventDescriptor
+          appleEventWithEventClass:kCoreEventClass
+                           eventID:kAEOpenApplication
+                  targetDescriptor:target
+                          returnID:kAutoGenerateReturnID
+                     transactionID:kAnyTransactionID];
+      [event setParamDescriptor:args forKeyword:keyDirectObject];
+
+      NSDictionary *err;
+      [[[NSAppleScript alloc] initWithSource:src]
+              executeAppleEvent:event error:&err];
+
+  Same change on the Outlook branch. This is the parameterised-
+  query analogue for AppleScript. Filename content is data, not
+  code; the AppleScript parser sees only a constant template.
+
+8.3 Architectural fix — NSSharingService, remove AppleScript path
+-----------------------------------------------------------------
+
+  Replace the AppleScript-driven mail-compose logic entirely
+  with NSSharingService (NSSharingServiceNameComposeEmail),
+  which is Apple's supported parameterised API for invoking
+  the user's default mail client. It uses typed parameters
+  (subject, items) and routes through LaunchServices, with
+  no AppleScript involved.
+
+      NSSharingService *service =
+          [NSSharingService sharingServiceNamed:
+              NSSharingServiceNameComposeEmail];
+      if(service && !attachmentPath.isEmpty()) {
+          service.subject = subject.toNSString() ?: @"";
+          NSURL *fileURL = [NSURL fileURLWithPath:
+                              attachmentPath.toNSString()];
+          if([service canPerformWithItems:@[fileURL]]) {
+              [service performWithItems:@[fileURL]];
+              return;
+          }
+      }
+      QDesktopServices::openUrl(url);    // last-resort fallback
+
+  Side benefit: the
+  com.apple.security.scripting-targets / com.apple.mail and
+  com.apple.security.temporary-exception.apple-events /
+  com.microsoft.outlook entitlements in qdigidoc4.entitlements
+  become unused and can be removed, reducing the impact
+  ceiling of any future AppleScript-source injection that may
+  appear elsewhere in the code base.
+
+Recommended additional steps:
+
+  1. Audit the Linux (xdg-email) and Windows (MAPI) mailto:
+     paths for analogous string-concatenation / command-
+     injection patterns. The Linux path in particular has
+     been a historical source of similar bugs in other
+     applications.
+
+  2. Add a regression test under client/tests (or equivalent
+     macOS-specific target). The test should construct a
+     synthetic QUrl with adversarial attachment / subject
+     values containing `"`, `\`, newlines, and AppleScript
+     keywords, pass it to Application::mailTo, and assert
+     that no AppleScript side-effect markers (e.g. a file
+     created by `do shell script "touch ..."`) appear after
+     dispatch. This prevents regression on future refactors.
+
+  3. Consider removing the in-process URL handler registration
+     in client/Application.cpp:417 if no remaining call site
+     genuinely needs in-process mailto: routing. The widget
+     code that calls QDesktopServices::openUrl with mailto: is
+     the only consumer found; it can call a platform-specific
+     compose helper directly, eliminating the URL-as-internal-
+     transport pattern altogether.
+
+
+--------------------------------------------------------------------------------
+9. PROPOSED DISCLOSURE TIMELINE
+--------------------------------------------------------------------------------
+
+  Day 0      Private report submitted (today).
+  Day 7      Expected acknowledgement from CERT-EE / RIA.
+  Day 30     Expected status update / fix ETA.
+  Day 90     Public disclosure reference window. The 90-day
+             timer is the industry-standard reference, not a
+             hard deadline. If RIA needs additional time for
+             testing, signing, notarisation, and staged
+             rollout (Mac App Store + standalone DMG), the
+             window will be extended on reasonable request.
+
+  Earlier coordinated disclosure is preferred and welcomed.
+  A CVE assignment request will be initiated after acknow-
+  ledgement, unless RIA prefers to coordinate via the CVE
+  Numbering Authority.
+
+Disclosure channels used:
+
+  1. cert@cert.ee — Estonian national CERT, primary channel.
+
+  GitHub Security Advisories are NOT available on the
+  open-eid/DigiDoc4-Client repository: the "Report a
+  vulnerability" button is missing and
+  /security/advisories/new returns 404.
+
+
+--------------------------------------------------------------------------------
+10. ATTACHMENTS
+--------------------------------------------------------------------------------
+
+  poc-mac-applescript/
+    README.md           — reproduction instructions
+    ADVISORY.txt        — this document
+
+    rickroll" & (do shell script ("open https:" &
+        (ASCII character 47) & (ASCII character 47) &
+        "youtu.be" & (ASCII character 47) &
+        "dQw4w9WgXcQ")) & ".cdoc
+                        — single working PoC, byte-identical
+                          to a valid signed container; the
+                          filename IS the payload.
+
+  Only one PoC is included by design. The side effect
+  (opening a YouTube URL) is deliberately benign and harmless
+  to run on a developer or RIA test workstation. The
+  vulnerability primitive is established by this single
+  demonstration; realistic attacker outcomes are described
+  in Section 5.
+
+
+--------------------------------------------------------------------------------
+END OF ADVISORY
+--------------------------------------------------------------------------------
